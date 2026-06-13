@@ -40,12 +40,37 @@ def get_opts():
                         help='number of views (including ref) to be used in testing')
     parser.add_argument('--depth_interval', type=float, default=2.65,
                         help='depth interval unit in mm')
+    parser.add_argument('--uw_degradations', nargs='+', type=str, default=['Bluish'],
+                        choices=['Bluish', 'Greenish', 'Hazy', 'Lowlight', 'all'],
+                        help='underwater image degradation types to use; use all for four types')
+    parser.add_argument('--scan_list_dir', type=str, default=None,
+                        help='directory containing train.txt/val.txt/test.txt; default uses root_dir if present')
     parser.add_argument('--n_depths', nargs='+', type=int, default=[8,32,48],
                         help='number of depths in each level')
     parser.add_argument('--interval_ratios', nargs='+', type=float, default=[1.0,2.0,4.0],
                         help='depth interval ratio to multiply with --depth_interval in each level')
     parser.add_argument('--num_groups', type=int, default=1, choices=[1, 2, 4, 8],
                         help='number of groups in groupwise correlation, must be a divisor of 8')
+    parser.add_argument('--use_refractive', default=False, action='store_true',
+                        help='use differentiable flat-port refractive camera warping')
+    parser.add_argument('--z_inner', type=float, default=10.0,
+                        help='distance from camera center to inner glass surface')
+    parser.add_argument('--glass_thickness', type=float, default=5.0,
+                        help='flat-port glass thickness')
+    parser.add_argument('--n_air', type=float, default=1.0,
+                        help='air refractive index')
+    parser.add_argument('--n_glass', type=float, default=1.52,
+                        help='glass refractive index')
+    parser.add_argument('--n_water', type=float, default=1.333,
+                        help='water refractive index')
+    parser.add_argument('--refractive_newton_iters', type=int, default=4,
+                        help='Newton iterations for differentiable refractive projection')
+    parser.add_argument('--refractive_depth_chunk', type=int, default=4,
+                        help='number of depth hypotheses projected at once in refractive warp')
+    parser.add_argument('--freeze_refractive_params', default=False, action='store_true',
+                        help='keep z_inner, glass_thickness and n_glass fixed')
+    parser.add_argument('--cost_reg_checkpoint', default=False, action='store_true',
+                        help='checkpoint 3D cost regularization to reduce training memory')
     parser.add_argument('--img_wh', nargs="+", type=int, default=[1152, 864],
                         help='resolution (img_w, img_h) of the image, must be multiples of 32')
     parser.add_argument('--ckpt_path', type=str, default='ckpts/exp2/_ckpt_epoch_10.ckpt',
@@ -73,10 +98,11 @@ def get_opts():
 def decode_batch(batch):
     imgs = batch['imgs']
     proj_mats = batch['proj_mats']
+    camera_mats = batch.get('camera_mats', None)
     init_depth_min = batch['init_depth_min'].item()
     depth_interval = batch['depth_interval'].item()
     scan, vid = batch['scan_vid']
-    return imgs, proj_mats, init_depth_min, depth_interval, \
+    return imgs, proj_mats, camera_mats, init_depth_min, depth_interval, \
            scan, vid
 
 
@@ -187,7 +213,9 @@ if __name__ == "__main__":
     dataset = dataset_dict[args.dataset_name] \
                 (args.root_dir, args.split,
                  n_views=args.n_views, depth_interval=args.depth_interval,
-                 img_wh=tuple(args.img_wh))
+                 img_wh=tuple(args.img_wh),
+                 uw_degradations=args.uw_degradations,
+                 scan_list_dir=args.scan_list_dir)
 
     if args.scan:
         scans = [args.scan]
@@ -195,10 +223,21 @@ if __name__ == "__main__":
         scans = dataset.scans
 
     # Step 1. Create depth estimation and probability for each scan
+    refractive_params = dict(z_inner=args.z_inner,
+                             glass_thickness=args.glass_thickness,
+                             n_air=args.n_air,
+                             n_glass=args.n_glass,
+                             n_water=args.n_water,
+                             learnable=not args.freeze_refractive_params,
+                             newton_iters=args.refractive_newton_iters,
+                             depth_chunk=args.refractive_depth_chunk)
     model = CascadeMVSNet(n_depths=args.n_depths,
                           interval_ratios=args.interval_ratios,
                           num_groups=args.num_groups,
-                          norm_act=ABN)
+                          norm_act=ABN,
+                          use_refractive=args.use_refractive,
+                          refractive_params=refractive_params,
+                          cost_reg_checkpoint=args.cost_reg_checkpoint)
     device = 'cpu' if args.cpu else 'cuda:0'
     model.to(device)
     load_ckpt(model, args.ckpt_path)
@@ -211,7 +250,7 @@ if __name__ == "__main__":
     else:
         data_range = range(len(dataset))
     for i in tqdm(data_range):
-        imgs, proj_mats, init_depth_min, depth_interval, \
+        imgs, proj_mats, camera_mats, init_depth_min, depth_interval, \
             scan, vid = decode_batch(dataset[i])
         
         os.makedirs(os.path.join(depth_dir, scan), exist_ok=True)
@@ -219,7 +258,11 @@ if __name__ == "__main__":
         with torch.no_grad():
             imgs = imgs.unsqueeze(0).to(device)
             proj_mats = proj_mats.unsqueeze(0).to(device)
-            results = model(imgs, proj_mats, init_depth_min, depth_interval)
+            if camera_mats is not None:
+                camera_mats = {k: v.unsqueeze(0).to(device)
+                               for k, v in camera_mats.items()}
+            results = model(imgs, proj_mats, init_depth_min, depth_interval,
+                            camera_mats)
         
         depth = results['depth_0'][0].cpu().numpy()
         depth = np.nan_to_num(depth) # change nan to 0

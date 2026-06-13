@@ -35,10 +35,21 @@ class MVSSystem(LightningModule):
 
         self.loss = loss_dict[hparams.loss_type](hparams.levels)
 
+        refractive_params = dict(z_inner=self.hparams.z_inner,
+                                 glass_thickness=self.hparams.glass_thickness,
+                                 n_air=self.hparams.n_air,
+                                 n_glass=self.hparams.n_glass,
+                                 n_water=self.hparams.n_water,
+                                 learnable=not self.hparams.freeze_refractive_params,
+                                 newton_iters=self.hparams.refractive_newton_iters,
+                                 depth_chunk=self.hparams.refractive_depth_chunk)
         self.model = CascadeMVSNet(n_depths=self.hparams.n_depths,
                                    interval_ratios=self.hparams.interval_ratios,
                                    num_groups=self.hparams.num_groups,
-                                   norm_act=InPlaceABN)
+                                   norm_act=InPlaceABN,
+                                   use_refractive=self.hparams.use_refractive,
+                                   refractive_params=refractive_params,
+                                   cost_reg_checkpoint=self.hparams.cost_reg_checkpoint)
 
         # if num gpu is 1, print model structure and number of params
         if self.hparams.num_gpus == 1:
@@ -58,10 +69,13 @@ class MVSSystem(LightningModule):
         masks = batch['masks']
         init_depth_min = batch['init_depth_min']
         depth_interval = batch['depth_interval']
-        return imgs, proj_mats, depths, masks, init_depth_min, depth_interval
+        camera_mats = batch.get('camera_mats', None)
+        return imgs, proj_mats, depths, masks, init_depth_min, depth_interval, camera_mats
 
-    def forward(self, imgs, proj_mats, init_depth_min, depth_interval):
-        return self.model(imgs, proj_mats, init_depth_min, depth_interval)
+    def forward(self, imgs, proj_mats, init_depth_min, depth_interval,
+                camera_mats=None):
+        return self.model(imgs, proj_mats, init_depth_min, depth_interval,
+                          camera_mats)
 
     def prepare_data(self):
         dataset = dataset_dict[self.hparams.dataset_name]
@@ -69,12 +83,16 @@ class MVSSystem(LightningModule):
                                      split='train',
                                      n_views=self.hparams.n_views,
                                      levels=self.hparams.levels,
-                                     depth_interval=self.hparams.depth_interval)
+                                     depth_interval=self.hparams.depth_interval,
+                                     uw_degradations=self.hparams.uw_degradations,
+                                     scan_list_dir=self.hparams.scan_list_dir)
         self.val_dataset = dataset(root_dir=self.hparams.root_dir,
                                    split='val',
                                    n_views=self.hparams.n_views,
                                    levels=self.hparams.levels,
-                                   depth_interval=self.hparams.depth_interval)
+                                   depth_interval=self.hparams.depth_interval,
+                                   uw_degradations=self.hparams.uw_degradations,
+                                   scan_list_dir=self.hparams.scan_list_dir)
 
     def configure_optimizers(self):
         self.optimizer = get_optimizer(self.hparams, self.model)
@@ -98,9 +116,9 @@ class MVSSystem(LightningModule):
     
     def training_step(self, batch, batch_nb):
         log = {'lr': get_learning_rate(self.optimizer)}
-        imgs, proj_mats, depths, masks, init_depth_min, depth_interval = \
+        imgs, proj_mats, depths, masks, init_depth_min, depth_interval, camera_mats = \
             self.decode_batch(batch)
-        results = self(imgs, proj_mats, init_depth_min, depth_interval)
+        results = self(imgs, proj_mats, init_depth_min, depth_interval, camera_mats)
         log['train/loss'] = loss = self.loss(results, depths, masks)
         
         with torch.no_grad():
@@ -128,9 +146,9 @@ class MVSSystem(LightningModule):
 
     def validation_step(self, batch, batch_nb):
         log = {}
-        imgs, proj_mats, depths, masks, init_depth_min, depth_interval = \
+        imgs, proj_mats, depths, masks, init_depth_min, depth_interval, camera_mats = \
             self.decode_batch(batch)
-        results = self(imgs, proj_mats, init_depth_min, depth_interval)
+        results = self(imgs, proj_mats, init_depth_min, depth_interval, camera_mats)
         log['val_loss'] = self.loss(results, depths, masks)
     
         if batch_nb == 0:

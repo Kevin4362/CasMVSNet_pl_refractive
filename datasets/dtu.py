@@ -9,7 +9,7 @@ from torchvision import transforms as T
 
 class DTUDataset(Dataset):
     def __init__(self, root_dir, split, n_views=3, levels=3, depth_interval=2.65,
-                 img_wh=None):
+                 img_wh=None, uw_degradations=None, scan_list_dir=None):
         """
         img_wh should be set to a tuple ex: (1152, 864) to enable test mode!
         """
@@ -18,6 +18,12 @@ class DTUDataset(Dataset):
         assert self.split in ['train', 'val', 'test'], \
             'split must be either "train", "val" or "test"!'
         self.img_wh = img_wh
+        self.uw_degradations = uw_degradations or ['Bluish']
+        if isinstance(self.uw_degradations, str):
+            self.uw_degradations = [self.uw_degradations]
+        if 'all' in self.uw_degradations:
+            self.uw_degradations = ['Bluish', 'Greenish', 'Hazy', 'Lowlight']
+        self.scan_list_dir = scan_list_dir
         if img_wh is not None:
             assert img_wh[0]%32==0 and img_wh[1]%32==0, \
                 'img_wh must both be multiples of 32!'
@@ -30,7 +36,12 @@ class DTUDataset(Dataset):
 
     def build_metas(self):
         self.metas = []
-        with open(f'datasets/lists/dtu/{self.split}.txt') as f:
+        scan_list_file = os.path.join(self.root_dir, f'{self.split}.txt')
+        if self.scan_list_dir is not None:
+            scan_list_file = os.path.join(self.scan_list_dir, f'{self.split}.txt')
+        elif not os.path.exists(scan_list_file):
+            scan_list_file = f'datasets/lists/dtu/{self.split}.txt'
+        with open(scan_list_file) as f:
             self.scans = [line.rstrip() for line in f.readlines()]
 
         # light conditions 0-6 for training
@@ -46,10 +57,16 @@ class DTUDataset(Dataset):
                     ref_view = int(f.readline().rstrip())
                     src_views = [int(x) for x in f.readline().rstrip().split()[1::2]]
                     for light_idx in light_idxs:
-                        self.metas += [(scan, light_idx, ref_view, src_views)]
+                        if self.img_wh is None:
+                            for uw_degradation in self.uw_degradations:
+                                self.metas += [(scan, uw_degradation, light_idx,
+                                                ref_view, src_views)]
+                        else:
+                            self.metas += [(scan, None, light_idx, ref_view, src_views)]
 
     def build_proj_mats(self):
         proj_mats = []
+        cam_mats = []
         for vid in range(49): # total 49 view ids
             if self.img_wh is None:
                 proj_mat_filename = os.path.join(self.root_dir,
@@ -65,16 +82,21 @@ class DTUDataset(Dataset):
 
             # multiply intrinsics and extrinsics to get projection matrix
             proj_mat_ls = []
+            intrinsics_ls = []
             for l in reversed(range(self.levels)):
                 proj_mat_l = np.eye(4)
                 proj_mat_l[:3, :4] = intrinsics @ extrinsics[:3, :4]
+                intrinsics_ls += [torch.FloatTensor(intrinsics.copy())]
                 intrinsics[:2] *= 2 # 1/4->1/2->1
                 proj_mat_ls += [torch.FloatTensor(proj_mat_l)]
             # (self.levels, 4, 4) from fine to coarse
             proj_mat_ls = torch.stack(proj_mat_ls[::-1])
+            intrinsics_ls = torch.stack(intrinsics_ls[::-1])
             proj_mats += [(proj_mat_ls, depth_min)]
+            cam_mats += [(intrinsics_ls, torch.FloatTensor(extrinsics))]
 
         self.proj_mats = proj_mats
+        self.cam_mats = cam_mats
 
     def read_cam_file(self, filename):
         with open(filename) as f:
@@ -146,24 +168,26 @@ class DTUDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = {}
-        scan, light_idx, ref_view, src_views = self.metas[idx]
+        scan, uw_degradation, light_idx, ref_view, src_views = self.metas[idx]
         # use only the reference view and first nviews-1 source views
         view_ids = [ref_view] + src_views[:self.n_views-1]
 
         imgs = []
         proj_mats = [] # record proj mats between views
+        intrinsics = []
+        rel_poses = []
         for i, vid in enumerate(view_ids):
             # NOTE that the id in image file names is from 1 to 49 (not 0~48)
             if self.img_wh is None:
                 img_filename = os.path.join(self.root_dir,
-                                f'Rectified/{scan}_train/rect_{vid+1:03d}_{light_idx}_r5000.png')
+                                f'Rectified_UW/{uw_degradation}/{scan}_train/rect_{vid+1:03d}_{light_idx}_r5000.png')
                 mask_filename = os.path.join(self.root_dir,
-                                f'Depths/{scan}/depth_visual_{vid:04d}.png')
+                                f'Depths_raw/{scan}/depth_visual_{vid:04d}.png')
                 depth_filename = os.path.join(self.root_dir,
-                                f'Depths/{scan}/depth_map_{vid:04d}.pfm')
+                                f'Depths_raw/{scan}/depth_map_{vid:04d}.pfm')
             else:
                 img_filename = os.path.join(self.root_dir,
-                                f'Rectified/{scan}/rect_{vid+1:03d}_{light_idx}_r5000.png')
+                                f'{scan}/images/{vid:08d}.jpg')
 
             img = Image.open(img_filename)
             if self.img_wh is not None:
@@ -172,6 +196,8 @@ class DTUDataset(Dataset):
             imgs += [img]
 
             proj_mat_ls, depth_min = self.proj_mats[vid]
+            intrinsics_ls, extrinsics = self.cam_mats[vid]
+            intrinsics += [intrinsics_ls]
 
             if i == 0:  # reference view
                 sample['init_depth_min'] = torch.FloatTensor([depth_min])
@@ -179,14 +205,20 @@ class DTUDataset(Dataset):
                     sample['masks'] = self.read_mask(mask_filename)
                     sample['depths'] = self.read_depth(depth_filename)
                 ref_proj_inv = torch.inverse(proj_mat_ls)
+                ref_ext_inv = torch.inverse(extrinsics)
             else:
                 proj_mats += [proj_mat_ls @ ref_proj_inv]
+                rel_poses += [torch.stack([extrinsics @ ref_ext_inv] * self.levels)]
 
         imgs = torch.stack(imgs) # (V, 3, H, W)
         proj_mats = torch.stack(proj_mats)[:,:,:3] # (V-1, self.levels, 3, 4) from fine to coarse
+        intrinsics = torch.stack(intrinsics) # (V, self.levels, 3, 3)
+        rel_poses = torch.stack(rel_poses) # (V-1, self.levels, 4, 4)
 
         sample['imgs'] = imgs
         sample['proj_mats'] = proj_mats
+        sample['camera_mats'] = {'intrinsics': intrinsics,
+                                 'rel_poses': rel_poses}
         sample['depth_interval'] = torch.FloatTensor([self.depth_interval])
         sample['scan_vid'] = (scan, ref_view)
 

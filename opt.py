@@ -15,6 +15,11 @@ def get_opts():
                         help='number of FPN levels (fixed to be 3!)')
     parser.add_argument('--depth_interval', type=float, default=2.65,
                         help='depth interval for the finest level, unit in mm')
+    parser.add_argument('--uw_degradations', nargs='+', type=str, default=['Bluish'],
+                        choices=['Bluish', 'Greenish', 'Hazy', 'Lowlight', 'all'],
+                        help='underwater image degradation types to use; use all for four types')
+    parser.add_argument('--scan_list_dir', type=str, default=None,
+                        help='directory containing train.txt/val.txt/test.txt; default uses root_dir if present')
     parser.add_argument('--n_depths', nargs='+', type=int, default=[8,32,48],
                         help='number of depths in each level')
     parser.add_argument('--interval_ratios', nargs='+', type=float, default=[1.0,2.0,4.0],
@@ -24,6 +29,26 @@ def get_opts():
     parser.add_argument('--loss_type', type=str, default='sl1',
                         choices=['sl1'],
                         help='loss to use')
+    parser.add_argument('--use_refractive', default=False, action='store_true',
+                        help='use differentiable flat-port refractive camera warping')
+    parser.add_argument('--z_inner', type=float, default=10.0,
+                        help='distance from camera center to inner glass surface')
+    parser.add_argument('--glass_thickness', type=float, default=5.0,
+                        help='flat-port glass thickness')
+    parser.add_argument('--n_air', type=float, default=1.0,
+                        help='air refractive index')
+    parser.add_argument('--n_glass', type=float, default=1.52,
+                        help='glass refractive index')
+    parser.add_argument('--n_water', type=float, default=1.333,
+                        help='water refractive index')
+    parser.add_argument('--refractive_newton_iters', type=int, default=4,
+                        help='Newton iterations for differentiable refractive projection')
+    parser.add_argument('--refractive_depth_chunk', type=int, default=4,
+                        help='number of depth hypotheses projected at once in refractive warp')
+    parser.add_argument('--freeze_refractive_params', default=False, action='store_true',
+                        help='keep z_inner, glass_thickness and n_glass fixed')
+    parser.add_argument('--cost_reg_checkpoint', default=False, action='store_true',
+                        help='checkpoint 3D cost regularization to reduce training memory')
 
     parser.add_argument('--batch_size', type=int, default=1,
                         help='batch size')
