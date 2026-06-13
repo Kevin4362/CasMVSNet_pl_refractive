@@ -34,6 +34,180 @@ Available training datasets:
 *  [DTU dataset](#dtu-dataset)
 *  [BlendedMVS](#blendedmvs)
 
+## Underwater refractive UwMVS training
+
+This fork adds a differentiable flat-port refractive camera layer for underwater MVS. The original CasMVSNet pinhole homography warp is still the default. Add `--use_refractive` to train with refractive geometry.
+
+The refractive path uses two depth meanings:
+
+* `depth_l`: camera-coordinate z-depth. This is the public output used by the existing loss, metrics, validation, and evaluation code.
+* `depth_ray_l`: underwater ray distance. This is used internally by the refractive warp.
+
+This keeps the dataset depth maps compatible with the original DTU-style z-depth supervision while using ray-distance geometry inside the cost volume.
+
+### Dataset layout
+
+Use the UwMVS training/validation root as `--root_dir`. In WSL, the Windows path
+
+```text
+D:\hurry\UwMVS\UwMVS_Training_Validation
+```
+
+is usually mounted as
+
+```text
+/mnt/d/hurry/UwMVS/UwMVS_Training_Validation
+```
+
+The expected directory structure is:
+
+```text
+UwMVS_Training_Validation/
+  Cameras/
+    pair.txt
+    train/
+      00000000_cam.txt
+      ...
+  Depths_raw/
+    scanXX/
+      depth_map_0000.pfm
+      depth_visual_0000.png
+      ...
+  Rectified_UW/
+    Bluish/
+      scanXX_train/
+        rect_001_0_r5000.png
+        ...
+    Greenish/
+    Hazy/
+    Lowlight/
+  train.txt
+  val.txt
+  test.txt
+```
+
+`datasets/dtu.py` first looks for `train.txt`, `val.txt`, and `test.txt` directly under `--root_dir`. If they are present, you do not need to copy them into `datasets/lists/dtu/`. Use `--scan_list_dir` only if you want to keep the split files somewhere else.
+
+### Underwater degradation selection
+
+The UwMVS underwater images are stored under four degradation types:
+
+* `Bluish`
+* `Greenish`
+* `Hazy`
+* `Lowlight`
+
+Choose them with `--uw_degradations`.
+
+Train only Bluish:
+
+```bash
+--uw_degradations Bluish
+```
+
+Train several types:
+
+```bash
+--uw_degradations Bluish Greenish Hazy
+```
+
+Train all four types:
+
+```bash
+--uw_degradations all
+```
+
+`all` expands every scan/view/light sample into four underwater variants, so one epoch is roughly four times longer than single-type training. Use all four types if the final model should be robust to different underwater appearances. Use one type only if the target test domain is known and fixed.
+
+### Recommended training commands
+
+Memory-safe fixed-refractive training for a 6 GB GPU:
+
+```bash
+python train.py \
+  --dataset_name dtu \
+  --root_dir /mnt/d/hurry/UwMVS/UwMVS_Training_Validation \
+  --uw_degradations all \
+  --use_refractive \
+  --freeze_refractive_params \
+  --refractive_depth_chunk 1 \
+  --cost_reg_checkpoint \
+  --num_epochs 16 --batch_size 1 \
+  --depth_interval 2.65 --n_depths 8 32 48 \
+  --interval_ratios 1.0 2.0 4.0 \
+  --optimizer adam --lr 1e-3 --lr_scheduler cosine \
+  --exp_name uw_refractive_fixed
+```
+
+This trains the MVS network with fixed refractive parameters. It is the most stable way to start on small GPUs.
+
+Fine-tune learnable refractive parameters after the fixed-geometry model runs:
+
+```bash
+python train.py \
+  --dataset_name dtu \
+  --root_dir /mnt/d/hurry/UwMVS/UwMVS_Training_Validation \
+  --uw_degradations all \
+  --use_refractive \
+  --refractive_depth_chunk 1 \
+  --cost_reg_checkpoint \
+  --num_epochs 4 --batch_size 1 \
+  --depth_interval 2.65 --n_depths 4 16 32 \
+  --interval_ratios 1.0 2.0 4.0 \
+  --optimizer adam --lr 1e-4 --lr_scheduler cosine \
+  --ckpt_path ckpts/uw_refractive_fixed/<checkpoint_name>.ckpt \
+  --exp_name uw_refractive_learnable
+```
+
+Remove `--freeze_refractive_params` to make `z_inner`, `glass_thickness`, and `n_glass` learnable. This needs more GPU memory because the Newton projection graph must be kept for backpropagation.
+
+### Important training options
+
+`--use_refractive`: Enables refractive cost-volume warping. Without this flag the model uses the original pinhole homography warp.
+
+`--z_inner`: Distance from camera center to the inner glass surface. Default: `10.0`.
+
+`--glass_thickness`: Flat-port glass thickness. Default: `5.0`.
+
+`--n_air`, `--n_glass`, `--n_water`: Refractive indices. Defaults: `1.0`, `1.52`, `1.333`.
+
+`--freeze_refractive_params`: Keeps `z_inner`, `glass_thickness`, and `n_glass` fixed. This greatly reduces memory because the refractive projection grid is computed without storing the Newton backprop graph. The network still trains normally, but the refractive physical parameters are not learned.
+
+`--refractive_newton_iters`: Number of Newton iterations for forward refractive projection. Default: `4`. Larger values may improve projection accuracy but cost more time and memory.
+
+`--refractive_depth_chunk`: Number of depth hypotheses projected at once in refractive warp. Smaller values reduce peak memory but slow training. On a 6 GB GPU use `1`; on larger GPUs try `2` or `4`.
+
+`--cost_reg_checkpoint`: Uses PyTorch checkpointing for the 3D cost regularization network. This saves activation memory during training by recomputing the 3D CNN in backward pass. It makes training slower but is useful on small GPUs.
+
+`--uw_degradations`: Underwater image type selection. Use one or more of `Bluish`, `Greenish`, `Hazy`, `Lowlight`, or use `all`.
+
+`--scan_list_dir`: Optional directory containing `train.txt`, `val.txt`, and `test.txt`. If not set, the dataset uses the split files under `--root_dir` when present.
+
+`--n_depths`: Number of depth hypotheses at each cascade level. Default: `8 32 48`. Reducing this, for example to `4 16 32`, is the most direct way to lower memory and speed up debugging.
+
+`--interval_ratios`: Multiplier for `--depth_interval` at each cascade level. Default: `1.0 2.0 4.0`.
+
+`--depth_interval`: Finest-level z-depth interval in dataset units. UwMVS/DTU-style training uses `2.65` by default.
+
+`--n_views`: Number of views including the reference view. Default: `3`. Increasing it usually improves MVS matching but increases memory and runtime.
+
+### Memory notes
+
+Refractive training is heavier than the original homography warp because it needs ray construction, pose transform, Newton projection, and `grid_sample`. Approximate guidance for `640x512`, `batch_size=1`, `n_views=3`, and `n_depths 8 32 48`:
+
+* 6 GB: use `--freeze_refractive_params --refractive_depth_chunk 1 --cost_reg_checkpoint`.
+* 8 GB: try learnable refractive parameters with `--refractive_depth_chunk 1` and checkpointing, or keep parameters frozen and increase chunk size.
+* 10-12 GB: more suitable for full learnable refractive training.
+* 16 GB+: comfortable for larger chunks, more views, or larger depth counts.
+
+If CUDA OOM occurs, try these in order:
+
+1. Set `--refractive_depth_chunk 1`.
+2. Add `--cost_reg_checkpoint`.
+3. Add `--freeze_refractive_params`.
+4. Reduce `--n_depths`, for example `4 16 32`.
+5. Reduce `--n_views`.
+
 ## DTU dataset
 
 ### Data download
